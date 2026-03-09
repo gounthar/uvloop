@@ -24,7 +24,7 @@ jobs:
 
       - name: Set up Python
         run: |
-          python3 -m venv /tmp/build-venv
+          python3 -m venv --system-site-packages /tmp/build-venv
           . /tmp/build-venv/bin/activate
           pip install --upgrade pip setuptools wheel cython
 
