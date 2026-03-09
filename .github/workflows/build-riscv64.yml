@@ -31,7 +31,7 @@ jobs:
       - name: Build wheel
         run: |
           . /tmp/build-venv/bin/activate
-          python3 setup.py bdist_wheel && cp dist/*.whl /tmp/wheels/
+          mkdir -p /tmp/wheels && python3 setup.py bdist_wheel && cp dist/*.whl /tmp/wheels/
 
       - name: Verify platform tag
         run: |
