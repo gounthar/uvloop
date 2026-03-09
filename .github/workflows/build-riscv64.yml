@@ -31,7 +31,7 @@ jobs:
       - name: Build wheel
         run: |
           . /tmp/build-venv/bin/activate
-          pip wheel . --no-deps --no-build-isolation --wheel-dir /tmp/wheels/
+          python3 setup.py bdist_wheel && cp dist/*.whl /tmp/wheels/
 
       - name: Verify platform tag
         run: |
