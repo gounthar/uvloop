@@ -6,6 +6,7 @@ import select
 import socket
 import unittest.mock
 import ssl
+import struct
 import sys
 import threading
 import time
@@ -736,6 +737,161 @@ class _TestTCP:
 
         with s1, s2:
             loop.run_until_complete(test())
+
+    def test_create_connection_sock_cancel_detaches(self):
+        async def client(addr):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setblocking(False)
+            try:
+                sock.connect(addr)
+            except BlockingIOError:
+                pass
+            await asyncio.sleep(0.01)
+
+            task = asyncio.ensure_future(
+                self.loop.create_connection(asyncio.Protocol, sock=sock))
+            await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+            # After cancellation the socket must be detached (fd == -1)
+            # so that its __del__ won't close a recycled fd.
+            self.assertEqual(sock.fileno(), -1)
+
+        def _recv_or_abort(sock):
+            try:
+                sock.recv_all(1)
+            except ConnectionAbortedError:
+                pass
+
+        with self.tcp_server(_recv_or_abort,
+                             max_clients=1,
+                             backlog=1) as srv:
+            self.loop.run_until_complete(client(srv.addr))
+
+    def test_create_connection_sock_cancel_fd_leak(self):
+        # Regression test for https://github.com/MagicStack/uvloop/issues/645
+        # and https://github.com/aio-libs/aiohttp/issues/10506
+        #
+        # When create_connection(sock=sock) is cancelled, the socket must
+        # be detached so its close()/`__del__` won't double-close the fd.
+        # Without the fix, libuv closes the fd but the socket object still
+        # references it, enabling a chain of fd corruption and data leak:
+        #
+        # 1. cancel → libuv closes fd N
+        # 2. New connection (victim) reuses fd N
+        # 3. Stale sock.close() closes fd N → breaks the victim
+        # 4. Another fd N is opened (new connection)
+        # 5. Victim writev(N) → data goes to the wrong connection
+
+        async def test():
+            srv = await asyncio.start_server(
+                lambda r, w: w.close(),
+                '127.0.0.1', 0,
+                family=socket.AF_INET)
+            addr = srv.sockets[0].getsockname()
+
+            # --- Step 1: create_connection with sock= and cancel it ---
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setblocking(False)
+            await self.loop.sock_connect(sock, addr)
+            stale_fd = sock.fileno()
+
+            task = self.loop.create_task(
+                self.loop.create_connection(asyncio.Protocol, sock=sock)
+            )
+            await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+            # --- Step 2: a victim connection reuses the fd ---
+            victim_tr, _ = await self.loop.create_connection(
+                asyncio.Protocol, *addr)
+            victim_fd = victim_tr.get_extra_info('socket').fileno()
+            if victim_fd != stale_fd:
+                victim_tr.close()
+                sock.close()
+                srv.close()
+                await srv.wait_closed()
+                raise unittest.SkipTest(
+                    f'fd not reused (got {victim_fd}, need {stale_fd})')
+
+            # --- Step 3: stale sock.close() must NOT kill the victim ---
+            # Allocate the socketpair BEFORE sock.close() so the pair
+            # fds don't collide with stale_fd.
+            spy_a, spy_b = socket.socketpair()
+            spy_b.setblocking(False)
+
+            sock.close()
+
+            # Check whether sock.close() broke the victim's fd.
+            victim_broken = False
+            try:
+                os.fstat(victim_fd)
+            except OSError:
+                victim_broken = True
+
+            if victim_broken:
+                # The victim's fd was killed — place a spy socket on
+                # the freed fd (in production this would be a new
+                # incoming connection).
+                os.dup2(spy_a.fileno(), stale_fd)
+            spy_a.close()
+
+            # Victim writes.  If victim_broken, writev(stale_fd) goes
+            # to the spy; otherwise it goes to the real connection.
+            victim_tr.write(b'LEAKED')
+
+            try:
+                leaked = spy_b.recv(4096)
+            except BlockingIOError:
+                leaked = b''
+
+            if victim_broken:
+                os.close(stale_fd)
+            spy_b.close()
+            victim_tr.close()
+            srv.close()
+            await srv.wait_closed()
+
+            self.assertEqual(leaked, b'',
+                             f"Data leaked to an unrelated socket: "
+                             f"got {leaked!r}")
+
+        self.loop.run_until_complete(test())
+
+    def test_create_connection_sock_abort_detaches(self):
+        # If the protocol aborts the transport in connection_made(),
+        # connection_lost() closes the transport before
+        # create_connection() resumes. The passed socket must still be
+        # detached, so that its __del__ won't close a recycled fd.
+        class AbortProto(asyncio.Protocol):
+            def connection_made(self, transport):
+                transport.abort()
+
+        async def test():
+            srv = await asyncio.start_server(
+                lambda r, w: w.close(),
+                '127.0.0.1', 0,
+                family=socket.AF_INET)
+            addr = srv.sockets[0].getsockname()
+
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setblocking(False)
+            await self.loop.sock_connect(sock, addr)
+
+            tr, _ = await self.loop.create_connection(AbortProto, sock=sock)
+            self.assertTrue(tr.is_closing())
+            await asyncio.sleep(0)
+
+            self.assertEqual(sock.fileno(), -1)
+
+            srv.close()
+            await srv.wait_closed()
+
+        self.loop.run_until_complete(test())
 
 
 class Test_UV_TCP(_TestTCP, tb.UVTestCase):
@@ -2401,7 +2557,7 @@ class _TestSSL(tb.SSLTestCase):
 
         async def start_server():
             extras = {'ssl_handshake_timeout': SSL_HANDSHAKE_TIMEOUT}
-            if self.implementation != 'asyncio':  # or self.PY38
+            if self.implementation != 'asyncio':
                 extras['ssl_shutdown_timeout'] = 0.5
 
             srv = await asyncio.start_server(
@@ -2523,10 +2679,6 @@ class _TestSSL(tb.SSLTestCase):
                 except ssl.SSLError as ex:
                     # Since OpenSSL 1.1.1, it raises "application data after
                     # close notify"
-                    # Python < 3.8:
-                    if ex.reason == 'KRB5_S_INIT':
-                        break
-                    # Python >= 3.8:
                     if ex.reason == 'APPLICATION_DATA_AFTER_CLOSE_NOTIFY':
                         break
                     raise ex
@@ -3188,6 +3340,48 @@ class _TestSSL(tb.SSLTestCase):
             await server.wait_closed()
 
         self.loop.run_until_complete(run_main())
+
+    def test_create_connection_ssl_sock_reset_detaches(self):
+        # If the peer resets the connection before the ClientHello is
+        # written, connection_lost() closes the transport before
+        # create_connection() resumes. The passed socket must still be
+        # detached, so that its __del__ won't close a recycled fd.
+        client_sslctx = self._create_client_ssl_context()
+
+        # silence error logger
+        self.loop.set_exception_handler(lambda *args: None)
+
+        def reset(reader, writer):
+            writer.get_extra_info('socket').setsockopt(
+                socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+            writer.transport.abort()
+
+        async def test():
+            srv = await asyncio.start_server(
+                reset, '127.0.0.1', 0, family=socket.AF_INET)
+            addr = srv.sockets[0].getsockname()
+
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setblocking(False)
+            await self.loop.sock_connect(sock, addr)
+
+            # Wait for the RST to arrive.
+            for _ in range(500):
+                if select.select([sock], [], [], 0)[0]:
+                    break
+                await asyncio.sleep(0.01)
+
+            with self.assertRaises(OSError):
+                await self.loop.create_connection(
+                    asyncio.Protocol, sock=sock,
+                    ssl=client_sslctx, server_hostname='')
+
+            self.assertEqual(sock.fileno(), -1)
+
+            srv.close()
+            await srv.wait_closed()
+
+        self.loop.run_until_complete(test())
 
 
 class Test_UV_TCPSSL(_TestSSL, tb.UVTestCase):

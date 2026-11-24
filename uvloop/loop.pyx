@@ -48,7 +48,6 @@ include "includes/stdlib.pxi"
 include "errors.pyx"
 
 cdef:
-    int PY39 = PY_VERSION_HEX >= 0x03090000
     int PY311 = PY_VERSION_HEX >= 0x030b0000
     int PY313 = PY_VERSION_HEX >= 0x030d0000
     uint64_t MAX_SLEEP = 3600 * 24 * 365 * 100
@@ -1404,7 +1403,7 @@ cdef class Loop:
         """Create a Future object attached to the loop."""
         return self._new_future()
 
-    def create_task(self, coro, *, name=None, context=None):
+    def create_task(self, coro, *, name=None, context=None, eager_start=None):
         """Schedule a coroutine object.
 
         Return a task object.
@@ -1417,7 +1416,12 @@ cdef class Loop:
         created when no context is provided.
         """
         self._check_closed()
-        if PY311:
+        if PY313:
+            if self._task_factory is None:
+                task = aio_Task(coro, loop=self, context=context, eager_start=eager_start)
+            else:
+                task = self._task_factory(self, coro, context=context, eager_start=eager_start)
+        elif PY311:
             if self._task_factory is None:
                 task = aio_Task(coro, loop=self, context=context)
             else:
@@ -2053,7 +2057,11 @@ cdef class Loop:
             tr = TCPTransport.new(self, protocol, None, waiter, context)
             try:
                 # libuv will make socket non-blocking
+                # We are not detaching the PSO from the now-libuv-managed
+                # FD here because of:
+                # https://github.com/python/asyncio/pull/449
                 tr._open(sock.fileno())
+                tr._attach_fileobj(sock)
                 tr._init_protocol()
                 await waiter
             except (KeyboardInterrupt, SystemExit):
@@ -2065,9 +2073,16 @@ cdef class Loop:
                 # up in `Transport._call_connection_made()`, and calling
                 # `_close()` before it is fine.
                 tr._close()
+                # Fix for:
+                #  * https://github.com/MagicStack/uvloop/issues/645
+                #  * https://github.com/MagicStack/uvloop/issues/738
+                # The underlying FD is closed in tr._close(), the owner of
+                # `sock` must not get a chance to double-close the same FD
+                # sometime later, because that FD may be reused by a new
+                # connection under load. So we detach the PSO from the
+                # already-closed FD here.
+                sock.detach()
                 raise
-
-            tr._attach_fileobj(sock)
 
         if ssl:
             app_transport = protocol._get_app_transport(context)
@@ -2301,15 +2316,16 @@ cdef class Loop:
             tr = UnixTransport.new(self, protocol, None, waiter, context)
             try:
                 tr._open(sock.fileno())
+                tr._attach_fileobj(sock)
                 tr._init_protocol()
                 await waiter
             except (KeyboardInterrupt, SystemExit):
                 raise
             except BaseException:
+                # See comments in create_connection() for more information
                 tr._close()
+                sock.detach()
                 raise
-
-            tr._attach_fileobj(sock)
 
         if ssl:
             app_transport = protocol._get_app_transport(Context_CopyCurrent())
@@ -2733,7 +2749,7 @@ cdef class Loop:
             # Only check when the default executor is being used
             self._check_default_executor()
             if executor is None:
-                executor = cc_ThreadPoolExecutor()
+                executor = cc_ThreadPoolExecutor(thread_name_prefix='uvloop')
                 self._default_executor = executor
 
         return aio_wrap_future(executor.submit(func, *args), loop=self)
@@ -3296,15 +3312,9 @@ class _SyncSocketReaderFuture(aio_Future):
             self.__loop.remove_reader(self.__sock)
             self.__sock = None
 
-    if PY39:
-        def cancel(self, msg=None):
-            self.__remove_reader()
-            aio_Future.cancel(self, msg=msg)
-
-    else:
-        def cancel(self):
-            self.__remove_reader()
-            aio_Future.cancel(self)
+    def cancel(self, msg=None):
+        self.__remove_reader()
+        aio_Future.cancel(self, msg=msg)
 
 
 class _SyncSocketWriterFuture(aio_Future):
@@ -3319,15 +3329,9 @@ class _SyncSocketWriterFuture(aio_Future):
             self.__loop.remove_writer(self.__sock)
             self.__sock = None
 
-    if PY39:
-        def cancel(self, msg=None):
-            self.__remove_writer()
-            aio_Future.cancel(self, msg=msg)
-
-    else:
-        def cancel(self):
-            self.__remove_writer()
-            aio_Future.cancel(self)
+    def cancel(self, msg=None):
+        self.__remove_writer()
+        aio_Future.cancel(self, msg=msg)
 
 
 include "cbhandles.pyx"
